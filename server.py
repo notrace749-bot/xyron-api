@@ -280,10 +280,32 @@ def use_license(data: LicenseRequest):
 @app.post("/license/check")
 def check_license(data: LicenseRequest):
 
+    key = data.license_key.strip()
+
+    conn = get_db()
+
+    row = conn.execute(
+        """
+        SELECT license_key, active
+        FROM licenses
+        WHERE license_key = ?
+        """,
+        (key,)
+    ).fetchone()
+
+    conn.close()
+
+    print(
+        "LICENSE CHECK:",
+        repr(key),
+        "RESULT:",
+        row
+    )
+
     return {
-        "valid": is_valid_license(
-            data.license_key
-        )
+        "valid": bool(row and row[1] == 1),
+        "found": bool(row),
+        "active": bool(row and row[1] == 1)
     }
 
 
