@@ -8,6 +8,22 @@ from datetime import datetime
 
 app = FastAPI(title="Xyron API")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+DB = "licenses.db"
+
+ADMIN_KEY = "XYRON_CHANGE_THIS_ADMIN_KEY"
+
+admin_tokens = set()
+
+app = FastAPI(title="Xyron API")
+
 # CORS
 # Web sitenin API'ye istek göndermesine izin verir.
 app.add_middleware(
