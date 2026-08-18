@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import secrets
 import sqlite3
@@ -6,6 +7,16 @@ import json
 from datetime import datetime
 
 app = FastAPI(title="Xyron API")
+
+# CORS
+# Web sitenin API'ye istek göndermesine izin verir.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 DB = "licenses.db"
 
