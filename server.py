@@ -1,496 +1,867 @@
-import tkinter as tk
-from tkinter import ttk, messagebox
-import requests
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+import secrets
+import sqlite3
 import json
+from datetime import datetime
+
+app = FastAPI(title="Xyron API")
+
+DB = "xyron.db"
+ADMIN_KEY = "XYRON_ADMIN_KEY"
+
+sessions = set()
 
 
-SERVER_URL = "https://xyron-api-1.onrender.com"
-
-BG = "#030208"
-PANEL = "#0b0712"
-WHITE = "#f7f2ff"
-MUTED = "#81798e"
-PURPLE = "#8b4dff"
-GREEN = "#63dc9a"
-RED = "#ef7777"
+def get_db():
+    return sqlite3.connect(DB)
 
 
-class AdminPanel:
+def init_db():
+    conn = get_db()
 
-    def __init__(self, root):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT UNIQUE NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+    """)
 
-        self.root = root
-        self.token = None
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT,
+            status TEXT NOT NULL,
+            detections INTEGER NOT NULL DEFAULT 0,
+            results TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
 
-        root.title(
-            "XYRON ADMIN"
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+
+class LicenseRequest(BaseModel):
+    license_key: str
+
+
+class AdminLoginRequest(BaseModel):
+    admin_key: str
+
+
+class ScanReport(BaseModel):
+    license_key: str | None = None
+    status: str
+    detections: int
+    results: list
+
+
+def generate_license():
+    raw = secrets.token_hex(16).upper()
+
+    return (
+        "XYRON-"
+        + raw[:4] + "-"
+        + raw[4:8] + "-"
+        + raw[8:12] + "-"
+        + raw[12:16]
+    )
+
+
+def check_admin(authorization):
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
         )
 
-        root.geometry(
-            "900x600"
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
         )
 
-        root.configure(
-            bg=BG
+    token = authorization[7:]
+
+    if token not in sessions:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized"
         )
 
-        self.login_ui()
+
+@app.get("/")
+def home():
+    return {
+        "service": "Xyron API",
+        "status": "online"
+    }
 
 
-    def clear(self):
-
-        for widget in self.root.winfo_children():
-            widget.destroy()
-
-
-    def login_ui(self):
-
-        self.clear()
-
-        frame = tk.Frame(
-            self.root,
-            bg=BG
+@app.post("/admin/login")
+def admin_login(data: AdminLoginRequest):
+    if data.admin_key != ADMIN_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin key"
         )
 
-        frame.pack(
-            expand=True
+    token = secrets.token_urlsafe(32)
+    sessions.add(token)
+
+    return {
+        "token": token
+    }
+
+
+@app.post("/license/create")
+def create_license(
+    authorization: str | None = Header(default=None)
+):
+    check_admin(authorization)
+
+    key = generate_license()
+
+    conn = get_db()
+
+    conn.execute(
+        """
+        INSERT INTO licenses
+        (license_key, active, created_at)
+        VALUES (?, 1, ?)
+        """,
+        (
+            key,
+            datetime.now().isoformat()
+        )
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "license_key": key
+    }
+
+
+@app.post("/license/use")
+def use_license(data: LicenseRequest):
+    old_key = data.license_key.strip()
+
+    conn = get_db()
+
+    row = conn.execute(
+        """
+        SELECT active
+        FROM licenses
+        WHERE license_key = ?
+        """,
+        (old_key,)
+    ).fetchone()
+
+    if not row or row[0] != 1:
+        conn.close()
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or inactive license"
         )
 
-        tk.Label(
-            frame,
-            text="XYRON",
-            bg=BG,
-            fg=WHITE,
-            font=("Arial", 38, "bold")
-        ).pack()
+    new_key = generate_license()
 
-        tk.Label(
-            frame,
-            text="ADMIN PANEL",
-            bg=BG,
-            fg=PURPLE,
-            font=("Arial", 10, "bold")
-        ).pack()
+    conn.execute(
+        """
+        UPDATE licenses
+        SET active = 0
+        WHERE license_key = ?
+        """,
+        (old_key,)
+    )
 
-        self.admin_key = tk.Entry(
-            frame,
-            width=35,
-            show="*",
-            bg=PANEL,
-            fg=WHITE,
-            insertbackground=WHITE,
-            relief="flat",
-            justify="center"
+    conn.execute(
+        """
+        INSERT INTO licenses
+        (license_key, active, created_at)
+        VALUES (?, 1, ?)
+        """,
+        (
+            new_key,
+            datetime.now().isoformat()
         )
+    )
 
-        self.admin_key.pack(
-            pady=25,
-            ipady=9
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True,
+        "new_key": new_key
+    }
+
+
+@app.post("/license/check")
+def check_license(data: LicenseRequest):
+    conn = get_db()
+
+    row = conn.execute(
+        """
+        SELECT active
+        FROM licenses
+        WHERE license_key = ?
+        """,
+        (data.license_key.strip(),)
+    ).fetchone()
+
+    conn.close()
+
+    return {
+        "valid": bool(row and row[0] == 1)
+    }
+
+
+@app.post("/scan/report")
+def scan_report(data: ScanReport):
+    conn = get_db()
+
+    conn.execute(
+        """
+        INSERT INTO scans
+        (license_key, status, detections, results, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            data.license_key,
+            data.status,
+            data.detections,
+            json.dumps(data.results),
+            datetime.now().isoformat()
         )
+    )
 
-        tk.Button(
-            frame,
-            text="LOGIN",
-            command=self.login,
-            bg=PURPLE,
-            fg="white",
-            relief="flat",
-            bd=0,
-            padx=35,
-            pady=9
-        ).pack()
+    conn.commit()
+    conn.close()
+
+    return {
+        "success": True
+    }
 
 
-    def login(self):
+@app.get("/admin/scans")
+def get_scans(
+    authorization: str | None = Header(default=None)
+):
+    check_admin(authorization)
 
-        key = self.admin_key.get().strip()
+    conn = get_db()
 
+    rows = conn.execute(
+        """
+        SELECT
+            id,
+            license_key,
+            status,
+            detections,
+            results,
+            created_at
+        FROM scans
+        ORDER BY id DESC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    scans = []
+
+    for row in rows:
         try:
-
-            response = requests.post(
-                SERVER_URL + "/admin/login",
-                json={
-                    "admin_key": key
-                },
-                timeout=10
-            )
-
-            if response.status_code != 200:
-
-                messagebox.showerror(
-                    "Xyron",
-                    "Invalid admin key."
-                )
-
-                return
-
-            self.token = response.json()["token"]
-
-            self.dashboard()
-
+            results = json.loads(row[4])
         except Exception:
+            results = []
 
-            messagebox.showerror(
-                "Xyron",
-                "Cannot connect to server."
-            )
+        scans.append({
+            "id": row[0],
+            "license_key": row[1],
+            "status": row[2],
+            "detections": row[3],
+            "results": results,
+            "created_at": row[5]
+        })
 
-
-    def dashboard(self):
-
-        self.clear()
-
-        top = tk.Frame(
-            self.root,
-            bg=BG
-        )
-
-        top.pack(
-            fill="x",
-            padx=25,
-            pady=20
-        )
-
-        tk.Label(
-            top,
-            text="XYRON ADMIN",
-            bg=BG,
-            fg=WHITE,
-            font=("Arial", 25, "bold")
-        ).pack(
-            side="left"
-        )
-
-        tk.Button(
-            top,
-            text="REFRESH",
-            command=self.load_scans,
-            bg=PURPLE,
-            fg="white",
-            relief="flat",
-            bd=0,
-            padx=20,
-            pady=7
-        ).pack(
-            side="right"
-        )
-
-        self.tree = ttk.Treeview(
-            self.root,
-            columns=(
-                "id",
-                "date",
-                "license",
-                "status",
-                "detections"
-            ),
-            show="headings"
-        )
-
-        self.tree.heading(
-            "id",
-            text="ID"
-        )
-
-        self.tree.heading(
-            "date",
-            text="DATE"
-        )
-
-        self.tree.heading(
-            "license",
-            text="LICENSE"
-        )
-
-        self.tree.heading(
-            "status",
-            text="STATUS"
-        )
-
-        self.tree.heading(
-            "detections",
-            text="DETECTIONS"
-        )
-
-        self.tree.column(
-            "id",
-            width=50
-        )
-
-        self.tree.column(
-            "date",
-            width=170
-        )
-
-        self.tree.column(
-            "license",
-            width=180
-        )
-
-        self.tree.column(
-            "status",
-            width=100
-        )
-
-        self.tree.column(
-            "detections",
-            width=100
-        )
-
-        self.tree.pack(
-            fill="both",
-            expand=True,
-            padx=25,
-            pady=10
-        )
-
-        self.tree.bind(
-            "<Double-1>",
-            self.show_scan
-        )
-
-        self.load_scans()
+    return {
+        "scans": scans
+    }
 
 
-    def load_scans(self):
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>XYRON ADMIN</title>
 
-        try:
+<style>
 
-            response = requests.get(
-                SERVER_URL + "/admin/scans",
-                headers={
-                    "Authorization":
-                    "Bearer " + self.token
-                },
-                timeout=10
-            )
+* {
+    box-sizing: border-box;
+}
 
-            if response.status_code != 200:
+body {
+    margin: 0;
+    background: #030208;
+    color: #f7f2ff;
+    font-family: Arial, sans-serif;
+}
 
-                messagebox.showerror(
-                    "Xyron",
-                    "Could not load scans."
-                )
+body:before {
+    content: "";
+    position: fixed;
+    width: 500px;
+    height: 500px;
+    background: #241047;
+    filter: blur(130px);
+    opacity: .45;
+    top: -180px;
+    left: -150px;
+    pointer-events: none;
+}
 
-                return
+header {
+    padding: 28px 7%;
+    border-bottom: 1px solid #25163d;
+    background: rgba(3,2,8,.75);
+}
 
-            data = response.json()
+h1 {
+    margin: 0;
+    font-size: 32px;
+    letter-spacing: 2px;
+}
 
-            for item in self.tree.get_children():
-                self.tree.delete(item)
+.subtitle {
+    margin-top: 5px;
+    color: #bd8cff;
+    font-size: 11px;
+    letter-spacing: 3px;
+}
 
-            for scan in data.get(
-                "scans",
-                []
-            ):
+.container {
+    max-width: 1150px;
+    margin: auto;
+    padding: 35px 20px;
+}
 
-                self.tree.insert(
-                    "",
-                    "end",
-                    iid=str(scan["id"]),
-                    values=(
-                        scan["id"],
-                        scan["created_at"],
-                        scan["license_key"],
-                        scan["status"],
-                        scan["detections"]
-                    )
-                )
+.login {
+    max-width: 400px;
+    margin: 80px auto;
+    padding: 35px;
+    background: #0b0712;
+    border: 1px solid #211330;
+    border-radius: 12px;
+}
 
-        except Exception:
+.login h2 {
+    margin-top: 0;
+}
 
-            messagebox.showerror(
-                "Xyron",
-                "Server connection failed."
-            )
+input {
+    width: 100%;
+    padding: 14px;
+    margin-top: 15px;
+    background: #030208;
+    border: 1px solid #2c174d;
+    color: white;
+    border-radius: 7px;
+    outline: none;
+}
+
+button {
+    margin-top: 15px;
+    padding: 11px 20px;
+    border: 0;
+    border-radius: 7px;
+    background: #8b4dff;
+    color: white;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+button:hover {
+    background: #a66fff;
+}
+
+.topbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 15px;
+}
+
+.scan {
+    background: #0b0712;
+    border: 1px solid #1d1229;
+    margin-top: 15px;
+    padding: 20px;
+    border-radius: 10px;
+}
+
+.scan:hover {
+    border-color: #58358b;
+}
+
+.clean {
+    color: #63dc9a;
+}
+
+.review {
+    color: #e9c46a;
+}
+
+.high {
+    color: #ef7777;
+}
+
+.result {
+    margin-top: 12px;
+    padding: 14px;
+    background: #05030a;
+    border: 1px solid #191020;
+    border-radius: 7px;
+    font-family: Consolas, monospace;
+    white-space: pre-wrap;
+}
+
+.hidden {
+    display: none;
+}
+
+#error {
+    color: #ef7777;
+    margin-top: 12px;
+}
+
+#licenseBox {
+    margin-top: 20px;
+    padding: 15px;
+    background: #0b0712;
+    border: 1px solid #25163d;
+    border-radius: 8px;
+}
+
+</style>
+</head>
+
+<body>
+
+<header>
+    <h1>XYRON ADMIN</h1>
+    <div class="subtitle">
+        SECURITY SCAN MANAGEMENT
+    </div>
+</header>
+
+<div class="container">
+
+    <div id="loginBox" class="login">
+
+        <h2>Admin Login</h2>
+
+        <input
+            id="adminKey"
+            type="password"
+            placeholder="Admin key"
+        >
+
+        <button onclick="login()">
+            LOGIN
+        </button>
+
+        <div id="error"></div>
+
+    </div>
 
 
-    def show_scan(self, event):
+    <div id="dashboard" class="hidden">
 
-        selected = self.tree.selection()
+        <div class="topbar">
 
-        if not selected:
-            return
+            <div>
+                <h2>SCAN RESULTS</h2>
+            </div>
 
-        scan_id = selected[0]
+            <div>
 
-        try:
+                <button onclick="createLicense()">
+                    CREATE LICENSE
+                </button>
 
-            response = requests.get(
-                SERVER_URL + "/admin/scans",
-                headers={
-                    "Authorization":
-                    "Bearer " + self.token
-                },
-                timeout=10
-            )
+                <button onclick="loadScans()">
+                    REFRESH
+                </button>
 
-            data = response.json()
+            </div>
 
-            scan = None
+        </div>
 
-            for item in data.get(
-                "scans",
-                []
-            ):
+        <div id="licenseBox"></div>
 
-                if str(item["id"]) == scan_id:
-                    scan = item
-                    break
+        <div id="scans"></div>
 
-            if not scan:
-                return
+    </div>
 
-            window = tk.Toplevel(
-                self.root
-            )
+</div>
 
-            window.title(
-                "Xyron Scan Result"
-            )
 
-            window.geometry(
-                "750x500"
-            )
+<script>
 
-            window.configure(
-                bg=BG
-            )
+let token =
+    localStorage.getItem("xyron_token");
 
-            text = tk.Text(
-                window,
-                bg=PANEL,
-                fg=WHITE,
-                insertbackground=WHITE,
-                relief="flat",
-                font=("Consolas", 10)
-            )
 
-            text.pack(
-                fill="both",
-                expand=True,
-                padx=15,
-                pady=15
-            )
+if (token) {
+    showDashboard();
+}
 
-            text.insert(
-                "end",
-                "XYRON SCAN RESULT\n"
-            )
 
-            text.insert(
-                "end",
-                "=================\n\n"
-            )
+async function login() {
 
-            text.insert(
-                "end",
-                "ID: "
-                + str(scan["id"])
-                + "\n"
-            )
+    const key =
+        document.getElementById(
+            "adminKey"
+        ).value;
 
-            text.insert(
-                "end",
-                "DATE: "
-                + scan["created_at"]
-                + "\n"
-            )
+    const error =
+        document.getElementById(
+            "error"
+        );
 
-            text.insert(
-                "end",
-                "STATUS: "
-                + scan["status"]
-                + "\n"
-            )
+    error.textContent = "";
 
-            text.insert(
-                "end",
-                "DETECTIONS: "
-                + str(scan["detections"])
-                + "\n\n"
-            )
+    try {
 
-            for item in scan["results"]:
+        const response =
+            await fetch(
+                "/admin/login",
+                {
+                    method: "POST",
+                    headers: {
+                        "Content-Type":
+                            "application/json"
+                    },
+                    body: JSON.stringify({
+                        admin_key: key
+                    })
+                }
+            );
 
-                text.insert(
-                    "end",
-                    "--------------------------------\n"
-                )
+        if (!response.ok) {
 
-                text.insert(
-                    "end",
+            error.textContent =
+                "Invalid admin key.";
+
+            return;
+        }
+
+        const data =
+            await response.json();
+
+        token = data.token;
+
+        localStorage.setItem(
+            "xyron_token",
+            token
+        );
+
+        showDashboard();
+
+    } catch (error) {
+
+        error.textContent =
+            "Cannot connect to server.";
+    }
+}
+
+
+function showDashboard() {
+
+    document
+        .getElementById("loginBox")
+        .classList
+        .add("hidden");
+
+    document
+        .getElementById("dashboard")
+        .classList
+        .remove("hidden");
+
+    loadScans();
+}
+
+
+async function createLicense() {
+
+    try {
+
+        const response =
+            await fetch(
+                "/license/create",
+                {
+                    method: "POST",
+                    headers: {
+                        "Authorization":
+                            "Bearer " + token
+                    }
+                }
+            );
+
+        if (!response.ok) {
+
+            alert(
+                "Could not create license."
+            );
+
+            return;
+        }
+
+        const data =
+            await response.json();
+
+        const box =
+            document.getElementById(
+                "licenseBox"
+            );
+
+        box.innerHTML =
+            "<b>NEW LICENSE:</b><br><br>"
+            + escapeHtml(
+                data.license_key
+            );
+
+    } catch (error) {
+
+        alert(
+            "Server connection failed."
+        );
+    }
+}
+
+
+async function loadScans() {
+
+    const scansBox =
+        document.getElementById(
+            "scans"
+        );
+
+    scansBox.innerHTML =
+        "<p>Loading...</p>";
+
+    try {
+
+        const response =
+            await fetch(
+                "/admin/scans",
+                {
+                    headers: {
+                        "Authorization":
+                            "Bearer " + token
+                    }
+                }
+            );
+
+        if (response.status === 401) {
+
+            localStorage.removeItem(
+                "xyron_token"
+            );
+
+            location.reload();
+
+            return;
+        }
+
+        const data =
+            await response.json();
+
+        scansBox.innerHTML = "";
+
+        if (!data.scans.length) {
+
+            scansBox.innerHTML =
+                "<p>No scans yet.</p>";
+
+            return;
+        }
+
+        for (
+            const scan of data.scans
+        ) {
+
+            const box =
+                document.createElement(
+                    "div"
+                );
+
+            box.className = "scan";
+
+            let statusClass =
+                String(
+                    scan.status
+                ).toLowerCase();
+
+            let results = "";
+
+            for (
+                const item
+                of scan.results
+            ) {
+
+                results +=
+                    "<div class='result'>";
+
+                results +=
                     "NAME: "
-                    + str(item.get("name"))
-                    + "\n"
-                )
-
-                text.insert(
-                    "end",
-                    "TYPE: "
-                    + str(item.get("type"))
-                    + "\n"
-                )
-
-                text.insert(
-                    "end",
-                    "RISK: "
-                    + str(item.get("risk"))
-                    + "\n"
-                )
-
-                text.insert(
-                    "end",
-                    "SCORE: "
-                    + str(item.get("score"))
-                    + "\n"
-                )
-
-                text.insert(
-                    "end",
-                    "SHA256: "
-                    + str(item.get("sha256"))
-                    + "\n"
-                )
-
-                text.insert(
-                    "end",
-                    "EVIDENCE:\n"
-                )
-
-                for evidence in item.get(
-                    "evidence",
-                    []
-                ):
-
-                    text.insert(
-                        "end",
-                        "  - "
-                        + str(evidence)
-                        + "\n"
+                    + escapeHtml(
+                        item.name
                     )
+                    + "\\n";
 
-                text.insert(
-                    "end",
-                    "\n"
+                results +=
+                    "TYPE: "
+                    + escapeHtml(
+                        item.type
+                    )
+                    + "\\n";
+
+                results +=
+                    "RISK: "
+                    + escapeHtml(
+                        item.risk
+                    )
+                    + "\\n";
+
+                results +=
+                    "SCORE: "
+                    + escapeHtml(
+                        item.score
+                    )
+                    + "\\n";
+
+                results +=
+                    "SHA256: "
+                    + escapeHtml(
+                        item.sha256
+                    )
+                    + "\\n";
+
+                if (item.evidence) {
+
+                    results +=
+                        "EVIDENCE:\\n";
+
+                    for (
+                        const evidence
+                        of item.evidence
+                    ) {
+
+                        results +=
+                            "- "
+                            + escapeHtml(
+                                evidence
+                            )
+                            + "\\n";
+                    }
+                }
+
+                results +=
+                    "</div>";
+            }
+
+            box.innerHTML =
+                "<b>SCAN #"
+                + escapeHtml(
+                    scan.id
                 )
+                + "</b><br>"
+                + "<span class='"
+                + statusClass
+                + "'>"
+                + escapeHtml(
+                    scan.status
+                )
+                + "</span>"
+                + "<br><br>"
+                + "DATE: "
+                + escapeHtml(
+                    scan.created_at
+                )
+                + "<br>"
+                + "LICENSE: "
+                + escapeHtml(
+                    scan.license_key ||
+                    "Unknown"
+                )
+                + "<br>"
+                + "DETECTIONS: "
+                + escapeHtml(
+                    scan.detections
+                )
+                + results;
 
-            text.config(
-                state="disabled"
-            )
+            scansBox.appendChild(
+                box
+            );
+        }
 
-        except Exception:
+    } catch (error) {
 
-            messagebox.showerror(
-                "Xyron",
-                "Could not load result."
-            )
+        scansBox.innerHTML =
+            "<p>Server connection failed.</p>";
+    }
+}
+
+
+function escapeHtml(value) {
+
+    if (
+        value === null ||
+        value === undefined
+    ) {
+        return "";
+    }
+
+    const div =
+        document.createElement(
+            "div"
+        );
+
+    div.textContent =
+        String(value);
+
+    return div.innerHTML;
+}
+
+</script>
+
+</body>
+</html>
+"""
 
 
 if __name__ == "__main__":
+    import uvicorn
 
-    root = tk.Tk()
-
-    AdminPanel(root)
-
-    root.mainloop()
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=8000
+    )
