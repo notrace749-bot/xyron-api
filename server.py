@@ -3,13 +3,17 @@ from pydantic import BaseModel
 import secrets
 import sqlite3
 import os
+import time
+import hashlib
+import hmac
+import base64
+import json
 from datetime import datetime
 
 app = FastAPI(title="Xyron License API")
 
 DB = "licenses.db"
 
-# Render Environment Variables bölümündeki değer
 ADMIN_KEY = os.environ.get("XYRON_ADMIN_KEY", "")
 
 
@@ -50,24 +54,116 @@ class LicenseRequest(BaseModel):
     license_key: str
 
 
+class LoginRequest(BaseModel):
+    admin_key: str
+
+
 # ==========================================
-# ADMIN AUTH
+# AUTH
 # ==========================================
 
-def check_admin(x_admin_key: str | None):
+def create_token():
+
+    payload = {
+        "type": "admin",
+        "exp": int(time.time()) + 60 * 60 * 12
+    }
+
+    payload_json = json.dumps(
+        payload,
+        separators=(",", ":")
+    ).encode()
+
+    payload_encoded = base64.urlsafe_b64encode(
+        payload_json
+    ).decode().rstrip("=")
+
+    signature = hmac.new(
+        ADMIN_KEY.encode(),
+        payload_encoded.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    return payload_encoded + "." + signature
+
+
+def verify_token(token):
+
+    if not token:
+        return False
+
+    try:
+
+        parts = token.split(".")
+
+        if len(parts) != 2:
+            return False
+
+        payload_encoded = parts[0]
+        received_signature = parts[1]
+
+        expected_signature = hmac.new(
+            ADMIN_KEY.encode(),
+            payload_encoded.encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        if not hmac.compare_digest(
+            received_signature,
+            expected_signature
+        ):
+            return False
+
+        padding = "=" * (
+            4 - len(payload_encoded) % 4
+        )
+
+        payload_json = base64.urlsafe_b64decode(
+            payload_encoded + padding
+        )
+
+        payload = json.loads(
+            payload_json.decode()
+        )
+
+        if payload.get("type") != "admin":
+            return False
+
+        if payload.get("exp", 0) < int(time.time()):
+            return False
+
+        return True
+
+    except Exception:
+        return False
+
+
+def check_admin(authorization):
+
     if not ADMIN_KEY:
         raise HTTPException(
             status_code=500,
-            detail="Admin key is not configured."
+            detail="XYRON_ADMIN_KEY is not configured."
         )
 
-    if not x_admin_key or not secrets.compare_digest(
-        x_admin_key,
-        ADMIN_KEY
-    ):
+    if not authorization:
         raise HTTPException(
             status_code=401,
-            detail="Unauthorized."
+            detail="Authorization required."
+        )
+
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authorization."
+        )
+
+    token = authorization[7:]
+
+    if not verify_token(token):
+        raise HTTPException(
+            status_code=401,
+            detail="Session expired or invalid."
         )
 
 
@@ -120,6 +216,51 @@ def home():
 
 
 # ==========================================
+# ADMIN LOGIN
+# ==========================================
+
+@app.post("/admin/login")
+def admin_login(data: LoginRequest):
+
+    if not ADMIN_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="Admin key is not configured."
+        )
+
+    if not secrets.compare_digest(
+        data.admin_key,
+        ADMIN_KEY
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin key."
+        )
+
+    return {
+        "success": True,
+        "token": create_token()
+    }
+
+
+# ==========================================
+# ADMIN CHECK
+# ==========================================
+
+@app.get("/admin/panel")
+def admin_panel(
+    authorization: str | None = Header(default=None)
+):
+
+    check_admin(authorization)
+
+    return {
+        "success": True,
+        "status": "authenticated"
+    }
+
+
+# ==========================================
 # LICENSE CHECK
 # ==========================================
 
@@ -151,13 +292,8 @@ def check_license(data: LicenseRequest):
             "valid": False
         }
 
-    if row["active"] != 1:
-        return {
-            "valid": False
-        }
-
     return {
-        "valid": True,
+        "valid": row["active"] == 1,
         "operator": "Licensed User"
     }
 
@@ -168,13 +304,10 @@ def check_license(data: LicenseRequest):
 
 @app.post("/license/create")
 def create_license(
-    x_admin_key: str | None = Header(
-        default=None,
-        alias="X-Admin-Key"
-    )
+    authorization: str | None = Header(default=None)
 ):
 
-    check_admin(x_admin_key)
+    check_admin(authorization)
 
     key = generate_license()
 
@@ -207,13 +340,10 @@ def create_license(
 
 @app.get("/license/list")
 def list_licenses(
-    x_admin_key: str | None = Header(
-        default=None,
-        alias="X-Admin-Key"
-    )
+    authorization: str | None = Header(default=None)
 ):
 
-    check_admin(x_admin_key)
+    check_admin(authorization)
 
     conn = get_db()
 
@@ -255,15 +385,10 @@ def list_licenses(
 @app.post("/license/revoke")
 def revoke_license(
     data: LicenseRequest,
-    x_admin_key: str | None = Header(
-        default=None,
-        alias="X-Admin-Key"
-    )
+    authorization: str | None = Header(default=None)
 ):
 
-    check_admin(x_admin_key)
-
-    key = data.license_key.strip()
+    check_admin(authorization)
 
     conn = get_db()
 
@@ -273,7 +398,7 @@ def revoke_license(
         SET active = 0
         WHERE license_key = ?
         """,
-        (key,)
+        (data.license_key.strip(),)
     )
 
     conn.commit()
@@ -294,15 +419,10 @@ def revoke_license(
 @app.post("/license/activate")
 def activate_license(
     data: LicenseRequest,
-    x_admin_key: str | None = Header(
-        default=None,
-        alias="X-Admin-Key"
-    )
+    authorization: str | None = Header(default=None)
 ):
 
-    check_admin(x_admin_key)
-
-    key = data.license_key.strip()
+    check_admin(authorization)
 
     conn = get_db()
 
@@ -312,7 +432,7 @@ def activate_license(
         SET active = 1
         WHERE license_key = ?
         """,
-        (key,)
+        (data.license_key.strip(),)
     )
 
     conn.commit()
@@ -323,24 +443,4 @@ def activate_license(
 
     return {
         "success": changed > 0
-    }
-
-
-# ==========================================
-# ADMIN TEST
-# ==========================================
-
-@app.get("/admin/panel")
-def admin_panel(
-    x_admin_key: str | None = Header(
-        default=None,
-        alias="X-Admin-Key"
-    )
-):
-
-    check_admin(x_admin_key)
-
-    return {
-        "service": "Xyron Admin API",
-        "status": "authenticated"
     }
