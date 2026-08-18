@@ -295,12 +295,8 @@ def check_license(data: LicenseRequest):
 
     conn.close()
 
-    print(
-        "LICENSE CHECK:",
-        repr(key),
-        "RESULT:",
-        row
-    )
+    print("LICENSE CHECK KEY:", repr(key))
+    print("LICENSE CHECK RESULT:", row)
 
     return {
         "valid": bool(row and row[1] == 1),
