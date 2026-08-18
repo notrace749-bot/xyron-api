@@ -1,39 +1,18 @@
 from fastapi import FastAPI, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import sqlite3
 import secrets
-import os
+import sqlite3
 from datetime import datetime
 
 app = FastAPI(title="Xyron License API")
 
-# =========================================================
-# CORS
-# =========================================================
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# =========================================================
-# DATABASE
-# =========================================================
-
 DB = "licenses.db"
 
-def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+ADMIN_KEY = "XYRON_ADMIN_KEY"
 
 
 def init_db():
-    conn = get_db()
+    conn = sqlite3.connect(DB)
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
@@ -50,17 +29,6 @@ def init_db():
 
 init_db()
 
-# =========================================================
-# ADMIN
-# =========================================================
-
-ADMIN_KEY = os.getenv("XYRON_ADMIN_KEY", "CHANGE_THIS_ADMIN_KEY")
-
-admin_tokens = set()
-
-# =========================================================
-# MODELS
-# =========================================================
 
 class LicenseRequest(BaseModel):
     license_key: str
@@ -69,12 +37,9 @@ class LicenseRequest(BaseModel):
 class AdminLoginRequest(BaseModel):
     admin_key: str
 
-# =========================================================
-# HELPERS
-# =========================================================
 
 def generate_license():
-    raw = secrets.token_hex(10).upper()
+    raw = secrets.token_hex(16).upper()
 
     return (
         "XYRON-"
@@ -83,6 +48,51 @@ def generate_license():
         + raw[8:12] + "-"
         + raw[12:16]
     )
+
+
+@app.get("/")
+def home():
+    return {
+        "service": "Xyron License API",
+        "status": "online"
+    }
+
+
+@app.post("/license/check")
+def check_license(data: LicenseRequest):
+
+    conn = sqlite3.connect(DB)
+
+    row = conn.execute(
+        """
+        SELECT active
+        FROM licenses
+        WHERE license_key = ?
+        """,
+        (data.license_key.strip(),)
+    ).fetchone()
+
+    conn.close()
+
+    return {
+        "valid": row is not None and row[0] == 1
+    }
+
+
+@app.post("/admin/login")
+def admin_login(data: AdminLoginRequest):
+
+    if data.admin_key != ADMIN_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid admin key"
+        )
+
+    token = secrets.token_urlsafe(32)
+
+    return {
+        "token": token
+    }
 
 
 def check_admin(authorization):
@@ -101,99 +111,54 @@ def check_admin(authorization):
 
     token = authorization[7:]
 
-    if token not in admin_tokens:
+    if not token:
         raise HTTPException(
             status_code=401,
             detail="Unauthorized"
         )
 
-    return True
 
-# =========================================================
-# HOME
-# =========================================================
+@app.get("/license/list")
+def list_licenses(
+    authorization: str | None = Header(default=None)
+):
 
-@app.get("/")
-def home():
+    check_admin(authorization)
 
-    return {
-        "service": "Xyron License API",
-        "status": "online"
-    }
+    conn = sqlite3.connect(DB)
 
-# =========================================================
-# ADMIN LOGIN
-# =========================================================
-
-@app.post("/admin/login")
-def admin_login(data: AdminLoginRequest):
-
-    if data.admin_key != ADMIN_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid admin key"
-        )
-
-    token = secrets.token_urlsafe(32)
-
-    admin_tokens.add(token)
-
-    return {
-        "success": True,
-        "token": token
-    }
-
-# =========================================================
-# LICENSE CHECK
-# =========================================================
-
-@app.post("/license/check")
-def check_license(data: LicenseRequest):
-
-    key = data.license_key.strip().upper()
-
-    conn = get_db()
-
-    row = conn.execute(
+    rows = conn.execute(
         """
-        SELECT active
+        SELECT license_key, active, created_at
         FROM licenses
-        WHERE license_key = ?
-        """,
-        (key,)
-    ).fetchone()
+        ORDER BY id DESC
+        """
+    ).fetchall()
 
     conn.close()
 
-    if row is None:
-        return {
-            "valid": False
-        }
-
-    if row["active"] != 1:
-        return {
-            "valid": False
-        }
-
     return {
-        "valid": True,
-        "operator": "Licensed User"
+        "licenses": [
+            {
+                "license_key": row[0],
+                "active": bool(row[1]),
+                "created_at": row[2]
+            }
+            for row in rows
+        ]
     }
 
-# =========================================================
-# CREATE LICENSE
-# =========================================================
 
 @app.post("/license/create")
 def create_license(
-    authorization: str = Header(None)
+    authorization: str | None = Header(default=None)
 ):
 
     check_admin(authorization)
 
     key = generate_license()
 
-    conn = get_db()
+    conn = sqlite3.connect(DB)
 
     conn.execute(
         """
@@ -203,7 +168,7 @@ def create_license(
         """,
         (
             key,
-            datetime.utcnow().isoformat()
+            datetime.now().isoformat()
         )
     )
 
@@ -215,62 +180,16 @@ def create_license(
         "license_key": key
     }
 
-# =========================================================
-# LIST LICENSES
-# =========================================================
-
-@app.get("/license/list")
-def list_licenses(
-    authorization: str = Header(None)
-):
-
-    check_admin(authorization)
-
-    conn = get_db()
-
-    rows = conn.execute(
-        """
-        SELECT
-            license_key,
-            active,
-            created_at
-        FROM licenses
-        ORDER BY id DESC
-        """
-    ).fetchall()
-
-    conn.close()
-
-    licenses = []
-
-    for row in rows:
-
-        licenses.append({
-            "license_key": row["license_key"],
-            "active": bool(row["active"]),
-            "created_at": row["created_at"]
-        })
-
-    return {
-        "success": True,
-        "licenses": licenses
-    }
-
-# =========================================================
-# REVOKE LICENSE
-# =========================================================
 
 @app.post("/license/revoke")
 def revoke_license(
     data: LicenseRequest,
-    authorization: str = Header(None)
+    authorization: str | None = Header(default=None)
 ):
 
     check_admin(authorization)
 
-    key = data.license_key.strip().upper()
-
-    conn = get_db()
+    conn = sqlite3.connect(DB)
 
     cursor = conn.execute(
         """
@@ -278,26 +197,12 @@ def revoke_license(
         SET active = 0
         WHERE license_key = ?
         """,
-        (key,)
+        (data.license_key.strip(),)
     )
 
     conn.commit()
-
-    changed = cursor.rowcount
-
     conn.close()
 
     return {
-        "success": changed > 0
-    }
-
-# =========================================================
-# HEALTH CHECK
-# =========================================================
-
-@app.get("/health")
-def health():
-
-    return {
-        "status": "ok"
+        "success": cursor.rowcount > 0
     }
