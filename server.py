@@ -2,24 +2,27 @@ from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 import secrets
 import sqlite3
+import json
 from datetime import datetime
 
 app = FastAPI(title="Xyron API")
 
 DB = "licenses.db"
 
-# BUNU DEĞİŞTİR
+# BURAYI KENDİ ADMIN ŞİFRENLE DEĞİŞTİR
 ADMIN_KEY = "XYRON_CHANGE_THIS_ADMIN_KEY"
 
+# Aktif admin oturumları
 admin_tokens = set()
 
 
-def db():
+def get_db():
     return sqlite3.connect(DB)
 
 
 def init_db():
-    conn = db()
+
+    conn = get_db()
 
     conn.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
@@ -37,7 +40,7 @@ def init_db():
             created_at TEXT NOT NULL,
             status TEXT NOT NULL,
             detections INTEGER NOT NULL,
-            results TEXT
+            results TEXT NOT NULL
         )
     """)
 
@@ -64,32 +67,33 @@ class ScanReport(BaseModel):
 
 
 def generate_license():
+
     raw = secrets.token_hex(16).upper()
 
     return (
         "XYRON-"
-        + raw[:4] + "-"
+        + raw[0:4] + "-"
         + raw[4:8] + "-"
         + raw[8:12] + "-"
         + raw[12:16]
     )
 
 
-def check_admin(authorization):
+def require_admin(authorization):
 
     if not authorization:
         raise HTTPException(
             status_code=401,
-            detail="Unauthorized"
+            detail="Authorization required"
         )
 
     if not authorization.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
-            detail="Unauthorized"
+            detail="Invalid authorization"
         )
 
-    token = authorization[7:]
+    token = authorization[7:].strip()
 
     if token not in admin_tokens:
         raise HTTPException(
@@ -98,18 +102,9 @@ def check_admin(authorization):
         )
 
 
-@app.get("/")
-def home():
-    return {
-        "service": "Xyron API",
-        "status": "online"
-    }
+def license_is_valid(key):
 
-
-@app.post("/license/check")
-def check_license(data: LicenseRequest):
-
-    conn = db()
+    conn = get_db()
 
     row = conn.execute(
         """
@@ -117,55 +112,105 @@ def check_license(data: LicenseRequest):
         FROM licenses
         WHERE license_key = ?
         """,
-        (data.license_key.strip(),)
+        (key.strip(),)
     ).fetchone()
 
     conn.close()
 
+    return bool(
+        row and row[0] == 1
+    )
+
+
+@app.get("/")
+def home():
+
     return {
-        "valid": bool(
-            row and row[0] == 1
-        )
+        "service": "Xyron API",
+        "status": "online"
     }
 
 
+# =========================================================
+# LICENSE CHECK
+# =========================================================
+
+@app.post("/license/check")
+def check_license(
+    data: LicenseRequest
+):
+
+    valid = license_is_valid(
+        data.license_key
+    )
+
+    return {
+        "valid": valid
+    }
+
+
+# =========================================================
+# ADMIN LOGIN
+# =========================================================
+
 @app.post("/admin/login")
-def admin_login(data: AdminLoginRequest):
+def admin_login(
+    data: AdminLoginRequest
+):
 
     if data.admin_key != ADMIN_KEY:
+
         raise HTTPException(
             status_code=401,
             detail="Invalid admin key"
         )
 
-    token = secrets.token_urlsafe(32)
+    token = secrets.token_urlsafe(
+        32
+    )
 
-    admin_tokens.add(token)
+    admin_tokens.add(
+        token
+    )
 
     return {
+        "success": True,
         "token": token
     }
 
 
+# =========================================================
+# CREATE LICENSE
+# =========================================================
+
 @app.post("/license/create")
 def create_license(
-    authorization: str | None = Header(default=None)
+    authorization: str | None = Header(
+        default=None
+    )
 ):
 
-    check_admin(authorization)
+    require_admin(
+        authorization
+    )
 
     key = generate_license()
 
-    conn = db()
+    conn = get_db()
 
     conn.execute(
         """
         INSERT INTO licenses
-        (license_key, active, created_at)
-        VALUES (?, 1, ?)
+        (
+            license_key,
+            active,
+            created_at
+        )
+        VALUES (?, ?, ?)
         """,
         (
             key,
+            1,
             datetime.now().isoformat()
         )
     )
@@ -179,18 +224,29 @@ def create_license(
     }
 
 
+# =========================================================
+# LIST LICENSES
+# =========================================================
+
 @app.get("/license/list")
 def list_licenses(
-    authorization: str | None = Header(default=None)
+    authorization: str | None = Header(
+        default=None
+    )
 ):
 
-    check_admin(authorization)
+    require_admin(
+        authorization
+    )
 
-    conn = db()
+    conn = get_db()
 
     rows = conn.execute(
         """
-        SELECT license_key, active, created_at
+        SELECT
+            license_key,
+            active,
+            created_at
         FROM licenses
         ORDER BY id DESC
         """
@@ -198,27 +254,38 @@ def list_licenses(
 
     conn.close()
 
+    licenses = []
+
+    for row in rows:
+
+        licenses.append({
+            "license_key": row[0],
+            "active": bool(row[1]),
+            "created_at": row[2]
+        })
+
     return {
-        "licenses": [
-            {
-                "license_key": row[0],
-                "active": bool(row[1]),
-                "created_at": row[2]
-            }
-            for row in rows
-        ]
+        "licenses": licenses
     }
 
+
+# =========================================================
+# REVOKE LICENSE
+# =========================================================
 
 @app.post("/license/revoke")
 def revoke_license(
     data: LicenseRequest,
-    authorization: str | None = Header(default=None)
+    authorization: str | None = Header(
+        default=None
+    )
 ):
 
-    check_admin(authorization)
+    require_admin(
+        authorization
+    )
 
-    conn = db()
+    conn = get_db()
 
     cursor = conn.execute(
         """
@@ -226,7 +293,9 @@ def revoke_license(
         SET active = 0
         WHERE license_key = ?
         """,
-        (data.license_key.strip(),)
+        (
+            data.license_key.strip(),
+        )
     )
 
     conn.commit()
@@ -237,29 +306,25 @@ def revoke_license(
     }
 
 
+# =========================================================
+# SCAN RESULT
+# =========================================================
+
 @app.post("/scan/report")
-def scan_report(data: ScanReport):
+def scan_report(
+    data: ScanReport
+):
 
-    conn = db()
+    key = data.license_key.strip()
 
-    license_row = conn.execute(
-        """
-        SELECT active
-        FROM licenses
-        WHERE license_key = ?
-        """,
-        (data.license_key.strip(),)
-    ).fetchone()
-
-    if not license_row or license_row[0] != 1:
-        conn.close()
+    if not license_is_valid(key):
 
         raise HTTPException(
             status_code=403,
             detail="Invalid license"
         )
 
-    import json
+    conn = get_db()
 
     conn.execute(
         """
@@ -274,7 +339,7 @@ def scan_report(data: ScanReport):
         VALUES (?, ?, ?, ?, ?)
         """,
         (
-            data.license_key.strip(),
+            key,
             datetime.now().isoformat(),
             data.status,
             data.detections,
@@ -293,14 +358,22 @@ def scan_report(data: ScanReport):
     }
 
 
+# =========================================================
+# ADMIN SCAN RESULTS
+# =========================================================
+
 @app.get("/admin/scans")
-def get_scans(
-    authorization: str | None = Header(default=None)
+def admin_scans(
+    authorization: str | None = Header(
+        default=None
+    )
 ):
 
-    check_admin(authorization)
+    require_admin(
+        authorization
+    )
 
-    conn = db()
+    conn = get_db()
 
     rows = conn.execute(
         """
@@ -318,19 +391,26 @@ def get_scans(
 
     conn.close()
 
-    import json
+    scans = []
+
+    for row in rows:
+
+        try:
+            results = json.loads(
+                row[5]
+            )
+        except Exception:
+            results = []
+
+        scans.append({
+            "id": row[0],
+            "license_key": row[1],
+            "created_at": row[2],
+            "status": row[3],
+            "detections": row[4],
+            "results": results
+        })
 
     return {
-        "scans": [
-            {
-                "id": row[0],
-                "license_key": row[1],
-                "created_at": row[2],
-                "status": row[3],
-                "detections": row[4],
-                "results": json.loads(row[5])
-            }
-            for row in rows
-        ]
-        for row in rows
+        "scans": scans
     }
